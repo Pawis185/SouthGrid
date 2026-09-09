@@ -31,7 +31,8 @@ from dataStorage.lerobot_camera import (
     close_cameras,
     probe_camera_hw,
 )
-from dataStorage.lerobot_data_storage import G1OmniPickerLeRobotStorage, LeRobotDatasetWriter
+from dataStorage.lerobot_classified import ClassifiedLeRobotHub
+from dataStorage.lerobot_data_storage import G1OmniPickerLeRobotStorage
 from devices.abstract_device import PicoJoystickDevice
 from orca_gym.devices.pico_joytsick import PicoJoystick, PicoJoystickKey
 from orca_gym.log.orca_log import OrcaLog, get_orca_logger
@@ -42,6 +43,24 @@ ENTRY_POINT = "envs.dataCollection.dataCollection_env:DataCollectionEnv"
 STREAM_TRIGGER_PATH = "/tmp/g1_lerobot_stream"
 
 base_dir = os.path.dirname(os.path.realpath(__file__))
+if base_dir not in sys.path:
+    sys.path.insert(0, base_dir)
+from g1_classification_review import (  # noqa: E402
+    CLASSIFICATION_BANNER,
+    DELETE,
+    DOUBTFUL,
+    GOOD,
+    NEUTRAL_HINT,
+    QUALIFIED,
+    READY_HINT,
+    SHUTDOWN,
+    CATEGORY_DIR,
+    CATEGORY_LABEL,
+    ClassificationReview,
+    grip_monitor_decision,
+    poll_pico_raw,
+)
+
 log_dir = os.path.join(base_dir, "logs")
 
 orca_logger = get_orca_logger(
@@ -344,6 +363,7 @@ def main() -> None:
     # ── 后台状态监控线程 ───────────────────────────────────────────────────────
     _monitor_stop = threading.Event()
     _discard_episode_event = threading.Event()   # 右Grip单按：丢弃本集并重置场景
+    _review_active = threading.Event()           # REVIEW 期间分类逻辑独占按键
     _first_connect_notified = {"done": False}    # 首次连接手柄提示（一次性）
     _POLL_DT = 0.02
     _STATUS_EVERY = 2.0
@@ -416,7 +436,20 @@ def main() -> None:
                     r_grip_only = r_grip and not l_grip
 
                     if now - _grip_debounce_t >= _GRIP_DEBOUNCE:
-                        if both_grip and not _both_grip_prev:
+                        tsc = manager.task_status_controller
+                        recording = (
+                            tsc is not None and tsc.current_status == TaskStatus.RUNNING
+                        )
+                        if _review_active.is_set():
+                            session_phase = "REVIEW"
+                        elif recording:
+                            session_phase = "RECORDING"
+                        else:
+                            session_phase = "IDLE"
+                        grip_action = grip_monitor_decision(
+                            session_phase, l_grip, r_grip, _both_grip_prev, _r_grip_only_prev
+                        )
+                        if grip_action == SHUTDOWN:
                             # 左右 Grip 同时按下 → 终止全部采集
                             orca_logger.info(
                                 "[Grip] 左右Grip同按 → 终止全部采集，等待编码完成后退出"
@@ -429,8 +462,8 @@ def main() -> None:
                                 pass
                             manager._shutdown_requested = True  # noqa: SLF001
                             _grip_debounce_t = now
-                        elif r_grip_only and not _r_grip_only_prev:
-                            # 右 Grip 单按 → 丢弃本集
+                        elif grip_action == "RECORDING_DISCARD":
+                            # 右 Grip 单按（仅 RECORDING/IDLE）→ 丢弃本集
                             orca_logger.info(
                                 "[Grip] 右Grip单按 → 丢弃本集，重置场景"
                             )
@@ -483,6 +516,10 @@ def main() -> None:
     ]
 
     def _gated_pico_update():
+        if _review_active.is_set():
+            # REVIEW: refresh raw Pico state only; do not run robot callbacks.
+            pico_device.pico_joystick.update([])
+            return
         tsc = manager.task_status_controller
         if tsc is not None and tsc.current_status == TaskStatus.RUNNING:
             pico_device.pico_joystick.update(_all_pico_keys)
@@ -504,13 +541,13 @@ def main() -> None:
     print("  右夹爪      A / B 键 或 右扳机", flush=True)
     print("  底盘移动    已关闭（摇杆空闲）", flush=True)
     print("-" * 60, flush=True)
-    print("  【采集流程（强制保存）】", flush=True)
+    print("  【采集流程（结束后四分类）】", flush=True)
     print("  注意：开始采集前机械臂保持静止，不响应手柄；开始后才随手柄运动", flush=True)
     print("  第1步 开始采集  →  轻按一下【左手柄 Grip 侧握键】", flush=True)
-    print("  第2步 遥操作完成后", flush=True)
-    print("         保 存   →  再轻按一下【左手柄 Grip 侧握键】（无论成功与否均保存）", flush=True)
-    print("  放弃本集        →  轻按【右手柄 Grip 侧握键】（丢弃数据，重置场景，继续采集）", flush=True)
-    print("  终止全部采集    →  【左右 Grip 同时按下】（等待编码保存后自动退出）", flush=True)
+    print("  第2步 结束本集  →  再轻按一下【左手柄 Grip 侧握键】", flush=True)
+    print("  第3步 分类保存  →  松开后：左Grip=好  X=合格  A=存疑  右Grip=删除", flush=True)
+    print("  放弃本集        →  录制中轻按【右手柄 Grip】（立即丢弃，不进入分类）", flush=True)
+    print("  终止全部采集    →  【左右 Grip 同时按下】", flush=True)
     print("  强制退出        →  终端按 Ctrl+C", flush=True)
     print("=" * 60, flush=True)
     print("", flush=True)
@@ -518,27 +555,54 @@ def main() -> None:
     try:
         scene_manager.show_ui_message(
             1,
-            "第一次按左侧握键=开始 第二次按左侧握键=保存 右侧握键=丢弃重置 左右同按=退出",
+            "左Grip开始/结束 结束后分类 录制中右Grip取消 左右同按退出",
             "0x00ff00", showtime=0,
         )
     except Exception as ui_err:
         orca_logger.warning("界面提示暂不可用")
 
+    def _safe_ui(msg: str, color: str = "0xffff00", showtime: int = 0) -> None:
+        try:
+            scene_manager.show_ui_message(1, msg, color, showtime=showtime)
+        except Exception:
+            orca_logger.warning("分类界面提示暂不可用")
+
+    def _run_classification_review() -> str:
+        print(CLASSIFICATION_BANNER, flush=True)
+        print(NEUTRAL_HINT, flush=True)
+        _safe_ui("数据初次分类：请先松开按键...", "0xffff00", 0)
+        review = ClassificationReview()
+        while True:
+            if manager._shutdown_requested:  # noqa: SLF001
+                return SHUTDOWN
+            buttons = poll_pico_raw(pico_device.pico_joystick)
+            decision = review.feed(buttons)
+            if review.became_ready:
+                print(READY_HINT, flush=True)
+                _safe_ui("左Grip=好 X=合格 A=存疑 右Grip=删除", "0x00ff00", 0)
+            if decision:
+                return decision
+            time.sleep(0.02)
+
     # ── 主循环 ────────────────────────────────────────────────────────────────
-    orca_logger.info(f"开始采集，LeRobot 输出: {lerobot_out}")
+    orca_logger.info(f"开始采集，分类输出根目录: {lerobot_out}")
+    hub = None
     writer = None
     try:
-        writer = LeRobotDatasetWriter.create(
+        hub = ClassifiedLeRobotHub(
+            parent_root=lerobot_out,
             repo_id=args.repo_id,
-            root=lerobot_out,
-            fps=args.fps,
-            camera_map=camera_map,
-            state_dim=storage.state_dim,
-            state_names=storage.state_names,
-            cam_shape=cam_shape,
-            resume=args.resume,
-            robot_type="g1_omnipicker",
+            writer_kwargs={
+                "fps": args.fps,
+                "camera_map": camera_map,
+                "state_dim": storage.state_dim,
+                "state_names": storage.state_names,
+                "cam_shape": cam_shape,
+                "robot_type": "g1_omnipicker",
+            },
+            staging_root=os.path.join(scratch_dir, "classification_staging"),
         )
+        writer = hub.staging
         storage.configure_lerobot(
             fps=args.fps,
             cameras=cameras,
@@ -549,7 +613,7 @@ def main() -> None:
             clock=args.clock,
             camera_source=args.camera_source,
         )
-        with writer:
+        with hub:
             _ep_idx = 0
             while not manager._shutdown_requested:  # noqa: SLF001
                 _ep_idx += 1
@@ -570,10 +634,10 @@ def main() -> None:
                     env.begin_save_video(ep_dir)
                     video_started = True
 
-                _collecting_ep_no = writer.num_episodes + 1
+                _collecting_ep_no = hub.total_episodes + 1
                 orca_logger.info(f"========== 正在采集第 {_collecting_ep_no} 集 ==========")
                 print(
-                    f"\n>>> 正在采集第 {_collecting_ep_no} 集（按左Grip开始，再按左Grip保存）",
+                    f"\n>>> 正在采集第 {_collecting_ep_no} 集（按左Grip开始，再按左Grip结束并分类）",
                     flush=True,
                 )
 
@@ -592,12 +656,12 @@ def main() -> None:
                         orca_logger.warning("相机数据流停止时遇到错误")
                     video_started = False
 
-                # 右Grip单按：丢弃本集并继续下一集
+                # 右Grip单按：丢弃本集并继续下一集（不进入 REVIEW）
                 if _discard_episode_event.is_set():
                     _discard_episode_event.clear()
                     manager._shutdown_requested = False  # noqa: SLF001  继续下一集
                     storage.clear_data()
-                    orca_logger.info(f"[EP {_ep_idx}] 已丢弃本集（右Grip），重置场景")
+                    orca_logger.info(f"[EP {_ep_idx}] 已丢弃本集（录制中右Grip），重置场景")
                     continue
 
                 # Ctrl+C 或 左右Grip同按：终止全部采集
@@ -618,35 +682,67 @@ def main() -> None:
                         f"目标 {args.fps} 的 90%，建议降低 --fps。"
                     )
 
-                # 按当前采集模式保存本集
-                orca_logger.info(f"[EP {_ep_idx}] 正在保存本集数据")
-                storage.save_data(
-                    task_info=manager.task.get_task_info(),
-                    scene_info=scene_manager.get_scene_info(),
-                    task_description=manager.task.get_task_description(),
+                parked = storage.park_episode(
                     episode_video_dir=ep_dir,
                     ep_start_wall=ep_start_wall,
                 )
+                if not parked:
+                    orca_logger.warning(f"[EP {_ep_idx}] 帧数不足，未进入分类")
+                    continue
+
+                orca_logger.info(f"[EP {_ep_idx}] 进入分类 REVIEW，机器人已冻结")
+                _review_active.set()
+                try:
+                    decision = _run_classification_review()
+                finally:
+                    _review_active.clear()
+
+                if decision == SHUTDOWN or manager._shutdown_requested:  # noqa: SLF001
+                    storage.clear_data()
+                    manager._shutdown_requested = True  # noqa: SLF001
+                    orca_logger.info("分类阶段收到退出，丢弃当前未保存集")
+                    break
+
+                if decision == DELETE:
+                    storage.clear_data()
+                    orca_logger.info(f"[EP {_ep_idx}] 分类=删除，不保存，不占 index")
+                    print(">>> 已删除本集（不保存），继续下一集", flush=True)
+                    _safe_ui("已删除，不保存", "0xff0000", 2)
+                    continue
+
+                dest = hub.writer_for(decision)
+                ep_saved = storage.commit_parked_episode(dest)
+                cat_dir = CATEGORY_DIR[decision]
+                cat_root = hub.category_root(decision)
                 orca_logger.info(
-                    f"✓ 本集已保存，当前共采集 {writer.num_episodes} 集 / {writer.num_frames} 帧"
+                    f"✓ 本集已保存到 {cat_dir}/ episode {ep_saved}，"
+                    f"该分类共 {dest.num_episodes} 集 / {dest.num_frames} 帧"
                 )
                 print(
-                    f">>> ✓ 本集已保存，当前共采集 {writer.num_episodes} 集",
+                    f">>> ✓ {CATEGORY_LABEL[decision]} → {cat_root}  "
+                    f"episode {ep_saved}（该分类共 {dest.num_episodes} 集）",
                     flush=True,
                 )
+                _safe_ui(f"已保存到{CATEGORY_LABEL[decision]}", "0x00ff00", 2)
 
     except KeyboardInterrupt:
         orca_logger.info("KeyboardInterrupt，停止采集")
         print("\n[停止] 采集已中断", flush=True)
+        if hub is not None:
+            try:
+                storage.clear_data()
+            except Exception:
+                pass
     except Exception as e:
         orca_logger.error(f"采集异常: {e}")
     finally:
+        _review_active.clear()
         _monitor_stop.set()
-        if writer is not None:
+        if hub is not None:
             try:
                 orca_logger.info("正在等待所有视频编码完成，请勿关闭程序...")
                 print("\n[退出] 正在等待所有视频编码完成，请勿关闭程序...", flush=True)
-                writer.close()
+                hub.close()
                 orca_logger.info("✓ 所有视频编码已完成")
                 print("[退出] ✓ 所有视频编码已完成", flush=True)
             except Exception:
@@ -662,14 +758,19 @@ def main() -> None:
             env.close()
         except Exception:
             pass
-        if writer is not None:
-            summary = f"采集结束，共 {writer.num_episodes} 集 / {writer.num_frames} 帧"
+        if hub is not None:
+            counts = hub.counts()
+            summary = (
+                f"采集结束，好={counts[GOOD]} 合格={counts[QUALIFIED]} "
+                f"存疑={counts[DOUBTFUL]}（未计入旧根目录数据）"
+            )
         else:
-            summary = "采集结束（未成功创建数据集）"
+            summary = "采集结束（未成功创建分类数据集）"
         orca_logger.info(summary)
         print(f"\n{'=' * 60}", flush=True)
         print(f"  {summary}", flush=True)
-        print(f"  数据位于: {lerobot_out}", flush=True)
+        print(f"  分类目录: {lerobot_out}/good|qualified|Doubtful", flush=True)
+        print(f"  旧数据仍在: {lerobot_out}（未覆盖）", flush=True)
         print(f"{'=' * 60}", flush=True)
 
 

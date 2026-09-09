@@ -1234,6 +1234,11 @@
                                     "type": "bool"
                                 },
                                 {
+                                    "name": "IsRecording",
+                                    "value": true,
+                                    "type": "bool"
+                                },
+                                {
                                     "name": "ColorPort",
                                     "value": 7090,
                                     "type": "int"
@@ -1430,6 +1435,11 @@
                                 },
                                 {
                                     "name": "UseNvEnc",
+                                    "value": true,
+                                    "type": "bool"
+                                },
+                                {
+                                    "name": "IsRecording",
                                     "value": true,
                                     "type": "bool"
                                 },

@@ -12,6 +12,7 @@ The validated runtime uses LeRobot 0.3.x, OrcaGym 26.7.3, PyAV, and PyArrow.
 from __future__ import annotations
 
 import av
+import copy
 import logging
 import os
 import queue
@@ -627,6 +628,71 @@ class LeRobotDatasetWriter:
 
         return cls(dataset, nvenc_enc, stats_writer, encode_backend=backend)
 
+    @classmethod
+    def create_or_resume(
+        cls,
+        repo_id: str,
+        root: str,
+        fps: int,
+        camera_map: dict,
+        state_dim: int,
+        state_names: list[str],
+        cam_shape: tuple,
+        robot_type: str = "humanoid",
+        action_names: list[str] | None = None,
+        action_dim: int | None = None,
+        encode_backend: str = "inproc",
+        enc_ring_slots: int = 96,
+    ) -> "LeRobotDatasetWriter":
+        """Create a new dataset, or safely resume an existing one.
+
+        Existing roots are never deleted. A missing or incompatible schema
+        fails closed so callers cannot overwrite prior episodes.
+        """
+        root_path = Path(root)
+        if root_path.exists():
+            meta_info = root_path / "meta" / "info.json"
+            if not meta_info.is_file():
+                raise ValueError(
+                    f"[resume] 目标目录已存在但不是合法 LeRobot dataset: {root}。"
+                    "拒绝自动删除重建。"
+                )
+            try:
+                return cls.create(
+                    repo_id=repo_id,
+                    root=root,
+                    fps=fps,
+                    camera_map=camera_map,
+                    state_dim=state_dim,
+                    state_names=state_names,
+                    cam_shape=cam_shape,
+                    resume=True,
+                    robot_type=robot_type,
+                    action_names=action_names,
+                    action_dim=action_dim,
+                    encode_backend=encode_backend,
+                    enc_ring_slots=enc_ring_slots,
+                )
+            except Exception as e:
+                raise ValueError(
+                    f"[resume] 无法安全续采已有数据集 {root}: {e}"
+                ) from e
+        return cls.create(
+            repo_id=repo_id,
+            root=root,
+            fps=fps,
+            camera_map=camera_map,
+            state_dim=state_dim,
+            state_names=state_names,
+            cam_shape=cam_shape,
+            resume=False,
+            robot_type=robot_type,
+            action_names=action_names,
+            action_dim=action_dim,
+            encode_backend=encode_backend,
+            enc_ring_slots=enc_ring_slots,
+        )
+
     def __enter__(self) -> "LeRobotDatasetWriter":
         return self
 
@@ -727,11 +793,109 @@ class LeRobotDatasetWriter:
         self._frame_idx = 0
         return ep_idx
 
+    def finish_uncommitted(self) -> None:
+        """Finish video encoding without writing parquet or category metadata."""
+        if getattr(self._nvenc_enc, "is_dead", False):
+            raise RuntimeError(
+                "[LeRobot] 编码子进程已死亡，拒绝 finish_uncommitted。"
+                "请 discard 本集并重跑。"
+            )
+        _log.info("[LeRobot] 结束本集 GPU 编码，等待 mp4 落盘（暂不提交分类）…")
+        self._nvenc_enc.end_episode()
+        if self._stats_writer is not None:
+            self._stats_writer.wait_until_done()
+
+    def _current_episode_index(self) -> int | None:
+        try:
+            ep_idx = self._dataset.episode_buffer.get("episode_index")
+            if ep_idx is not None:
+                return int(ep_idx)
+        except Exception:
+            pass
+        enc_idx = getattr(self._nvenc_enc, "_ep_idx", None)
+        if enc_idx is not None:
+            return int(enc_idx)
+        return None
+
+    def _delete_uncommitted_media(self) -> None:
+        """Remove staging videos and leftover stats images for the current episode."""
+        ep_idx = self._current_episode_index()
+        if ep_idx is None:
+            return
+        try:
+            for vk in self._dataset.meta.video_keys:
+                video_path = Path(str(self._dataset.root)) / self._dataset.meta.get_video_file_path(
+                    ep_idx, vk
+                )
+                if video_path.exists():
+                    video_path.unlink()
+        except Exception:
+            pass
+        try:
+            for vk in self._dataset.meta.video_keys:
+                img_dir = self._dataset._get_image_file_path(
+                    episode_index=ep_idx, image_key=vk, frame_index=0
+                ).parent
+                if img_dir.exists():
+                    shutil.rmtree(img_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    def commit_uncommitted_to(self, dest: "LeRobotDatasetWriter") -> int:
+        """Commit the parked staging episode into ``dest`` with dest's next index.
+
+        Videos are copied from the uncommitted staging paths into dest. This is
+        not a post-finalize move of a category dataset, and dest does not encode
+        the same frames a second time.
+        """
+        src_ds = self._dataset
+        dest_ds = dest._dataset
+        src_ep = self._current_episode_index()
+        if src_ep is None:
+            raise RuntimeError("[LeRobot] staging 没有可提交的 episode")
+        dest_ep = int(dest_ds.meta.total_episodes)
+
+        for feat_key in src_ds.meta.video_keys:
+            src_vid = Path(str(src_ds.root)) / src_ds.meta.get_video_file_path(src_ep, feat_key)
+            dest_vid = Path(str(dest_ds.root)) / dest_ds.meta.get_video_file_path(dest_ep, feat_key)
+            if dest_vid.exists():
+                raise RuntimeError(f"[LeRobot] 目标视频已存在，拒绝覆盖: {dest_vid}")
+            if not src_vid.is_file():
+                raise RuntimeError(f"[LeRobot] staging 视频缺失，拒绝提交: {src_vid}")
+            dest_vid.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_vid, dest_vid)
+            try:
+                src_vid.unlink()
+            except Exception:
+                pass
+
+        buf = copy.deepcopy(src_ds.episode_buffer)
+        buf["episode_index"] = dest_ep
+        dest_ds.episode_buffer = buf
+
+        _log.info("[LeRobot] 正在将本集写入分类数据集…")
+        ep_idx = dest_ds.save_episode_data_only()
+        dest_ds.encode_episode_videos(ep_idx)
+        dest._saved_episodes += 1
+        dest._frame_idx = 0
+
+        self._delete_uncommitted_media()
+        try:
+            self._nvenc_enc.cleanup_episode()
+        except Exception:
+            pass
+        src_ds.clear_episode_buffer()
+        src_ds.episode_buffer = src_ds.create_episode_buffer()
+        self._frame_idx = 0
+        _log.info(f"✓  [LeRobot] Episode {ep_idx} 已提交到 {dest_ds.root}")
+        return ep_idx
+
     def discard_episode(self) -> None:
-        """丢弃本集缓存（帧数不足时调用）。"""
+        """丢弃本集缓存（帧数不足、REVIEW 删除或录制中取消时调用）。"""
         if self._stats_writer is not None:
             self._stats_writer.drop_pending()
         self._nvenc_enc.discard_episode()
+        self._delete_uncommitted_media()
         self._dataset.clear_episode_buffer()
         self._dataset.episode_buffer = self._dataset.create_episode_buffer()
         self._frame_idx = 0
@@ -881,6 +1045,77 @@ class LeRobotSimSyncMixin:
             f"[LeRobot] ✓ 提交 {written} 帧（流式落盘），Episode {ep_idx} 后台处理中"
         )
         self._reset_episode()
+
+    def park_episode(
+        self,
+        episode_video_dir: str | None = None,
+        ep_start_wall: float | None = None,
+        **kwargs,
+    ) -> bool:
+        """Finish the current episode as uncommitted staging. Return False if discarded."""
+        if self._lr_camera_source == "mp4":
+            return self._park_data_mp4(episode_video_dir, ep_start_wall)
+
+        if self._lr_count < 2:
+            _log.warning(
+                f"[LeRobot] 帧数不足（门控次数={self._lr_count}），丢弃本集"
+            )
+            self._lr_writer.discard_episode()
+            self._reset_episode()
+            return False
+
+        self._log_cam_alignment()
+        self._lr_writer.finish_uncommitted()
+        return True
+
+    def commit_parked_episode(self, dest_writer: LeRobotDatasetWriter) -> int:
+        """Commit a parked staging episode into ``dest_writer``."""
+        ep_idx = self._lr_writer.commit_uncommitted_to(dest_writer)
+        written = max(self._lr_count - 1, 0)
+        _log.info(
+            f"[LeRobot] ✓ 提交 {written} 帧到 {dest_writer._dataset.root}，Episode {ep_idx}"
+        )
+        self._reset_episode()
+        return ep_idx
+
+    def _park_data_mp4(self, episode_video_dir: str | None, ep_start_wall: float | None) -> bool:
+        if episode_video_dir is None:
+            _log.error("[LeRobot] mp4 模式 park_episode 必须传 episode_video_dir，丢弃本集")
+            self._lr_writer.discard_episode()
+            self._reset_episode()
+            return False
+
+        N = len(self._lr_states)
+        if N < 2:
+            _log.warning(f"[LeRobot] mp4 模式帧数不足（{N} 条 state 记录），丢弃本集")
+            self._lr_writer.discard_episode()
+            self._reset_episode()
+            return False
+
+        states = [s for s, _ in self._lr_states]
+        wall_ts = [t for _, t in self._lr_states]
+        ep_start = ep_start_wall if ep_start_wall is not None else (
+            self._lr_ep_start_wall if self._lr_ep_start_wall is not None else wall_ts[0]
+        )
+
+        _log.info(f"[LeRobot] mp4 模式：从 {episode_video_dir} 逐帧提取 {N} 帧（生成器模式）...")
+        cams = camera_keys(self._lr_camera_map)
+        frame_gen = iter_frames_from_mp4(
+            episode_video_dir, self._lr_camera_map, wall_ts, ep_start, self._lr_target_hw
+        )
+        for i, images in enumerate(frame_gen):
+            if i >= N - 1:
+                break
+            frame: dict = {
+                "observation.state": states[i].astype(np.float32),
+                "action": self.build_action(states[i], states[i + 1]).astype(np.float32),
+            }
+            for cam_key in cams:
+                frame[f"observation.images.{cam_key}"] = images[cam_key]
+            self._lr_writer.stream_frame(frame, self._lr_task)
+
+        self._lr_writer.finish_uncommitted()
+        return True
 
     def _save_data_mp4(self, episode_video_dir: str | None, ep_start_wall: float | None) -> None:
         if episode_video_dir is None:
