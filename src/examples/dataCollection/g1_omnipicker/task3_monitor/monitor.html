@@ -1,0 +1,29 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><title>Task3 · Pico 采集监控</title>
+<style>body{font:16px system-ui;background:#101b28;color:#edf4fb;margin:24px}h1{font-size:24px}.muted{color:#9db1c6}#score{font-size:40px;color:#67e1b5}canvas{background:#17283a;border:1px solid #39536c;width:48%;max-width:740px}table{border-collapse:collapse;width:100%;margin:20px 0}td,th{overflow-wrap:anywhere;max-width:500px;text-align:left;padding:10px;border-bottom:1px solid #39536c}button,select{padding:8px;background:#29435c;color:white;border:1px solid #7492ad}pre{white-space:pre-wrap;font-size:13px}.warn{color:#ffcb78}</style>
+<h1>Task3 · Pico 采集监控</h1><p class="muted">主机只读页面 · 本地官方规则，正式 attempt = 0 · 原始相机图像无标记</p>
+<div id="score">等待日志</div><p id="status"></p>
+<p>参考工具 <select id="tool"></select> 视野 <select id="zoom"><option value="1.4">全场</option><option value="0.10">箱内 10 cm</option><option value="0.005">峰值 5 mm</option></select> <button id="save">保存独立标记预览 PNG</button></p>
+<canvas id="xy" width="740" height="480"></canvas> <canvas id="xz" width="740" height="480"></canvas>
+<p class="muted">世界坐标正交图（米），非相机投影。● 当前工具　✚ 工具箱满分理论中心　□ 已观察抓取末端参考　◇ 已观察释放工具参考。虚线＝未验证接近引导。紫色＝reach 满分球壳与当前底盘高度平面的交线。</p>
+<table><thead><tr><th>评分项</th><th>当前前缀／结束复核分</th><th>工具距中心</th><th>官方诊断</th></tr></thead><tbody id="rows"></tbody></table>
+<p class="warn">满分峰值约 1.249 mm；另有 0.3 m 内持续 1 秒门槛。松手后的落定位置与轨迹曾达到的峰值不同。抓取／释放／稳定状态仅为原始接触和位置的辅助观察，不等同官方评分条件。</p>
+<details open><summary>接触、夹爪和留箱辅助观察</summary><pre id="contacts"></pre></details>
+<details><summary>theoretical / observed / recommended 依据与范围</summary><pre id="evidence"></pre></details>
+<details><summary>评分版本、时间和日志状态</summary><pre id="meta"></pre></details>
+<script>
+let latest=null;const $=s=>document.getElementById(s), colors=['#f8bc65','#67e1b5','#82a8ff','#ee8cbb','#c5a4ff'];
+function draw(id,axes,scene){const c=$(id),g=c.getContext('2d');g.clearRect(0,0,c.width,c.height);g.fillStyle='#edf4fb';g.font='15px system-ui';g.fillText(axes[1]===1?'俯视 XY':'侧视 XZ',20,25);const b=scene.box,scale=230/Number($('zoom').value),pt=p=>[c.width/2+(p[axes[0]]-b[axes[0]])*scale,c.height/2-(p[axes[1]]-b[axes[1]])*scale];
+function circle(p,r,color){let[x,y]=pt(p);g.strokeStyle=color;g.beginPath();g.arc(x,y,r*scale,0,2*Math.PI);g.stroke()}
+for(let i=-4;i<=4;i++){g.strokeStyle='#294158';g.beginPath();g.moveTo(0,240+i*65);g.lineTo(740,240+i*65);g.stroke();g.fillStyle='#8ba3ba';g.fillText((b[axes[1]]-i*65/scale).toFixed(3),5,240+i*65)}
+circle(b,.3,'#627e92');circle(b,.001249,'#67e1b5');
+const perpendicular=axes[1]===1?2:1,delta=scene.base[perpendicular]-b[perpendicular];for(const r of scene.reach_shell_m){if(Math.abs(delta)<r)circle(b,Math.sqrt(r*r-delta*delta),'#bd86ec')}
+function mark(p,text,color,shape='●'){let[x,y]=pt(p);g.fillStyle=color;g.fillText(shape,x-5,y+5);g.fillText(text,x+10,y-8)}
+mark(b,'理论中心','#67e1b5','✚');mark(scene.base,'底盘','#c5a4ff');mark(scene.ee,'右末端','#fff');
+scene.tools.forEach((t,i)=>{mark(t.current,t.key===$('tool').value?t.label:String(i+1),colors[i]);if(t.key===$('tool').value){mark(t.grasp,'抓取参考',colors[i],'□');mark(t.release,'释放参考',colors[i],'◇');const a=pt(t.approach),z=pt(t.grasp);g.strokeStyle=colors[i];g.setLineDash([5,5]);g.beginPath();g.moveTo(...a);g.lineTo(...z);g.stroke();g.setLineDash([]);for(let k=0;k<3;k++){const p=t.grasp.map((v,j)=>v+t.grasp_axes[j][k]*.06),end=pt(p);g.strokeStyle=['#ff8b8b','#75dfaf','#87b5ff'][k];g.beginPath();g.moveTo(...z);g.lineTo(...end);g.stroke()}}});}
+function render(d){latest=d;const s=d.score;$('score').textContent=s.status==='ok'?`${s.total.toFixed(2)} / 40`:`${s.status==='stale'?'数据过期':'不可评分'}`;$('status').textContent=`${s.source==='synthetic_test'?'合成测试 · ':''}${d.state||''} · ${s.kind==='episode_review'?'episode 结束复核':'当前轨迹前缀（短时惩罚会随时长变化）'} · ${s.reason||''} · ${s.kind==='episode_review'?'已结束，显示最后场景':`场景延迟 ${Number(d.scene_age_s||0).toFixed(1)} 秒`}`;
+if(d.scene){if(!$('tool').options.length)d.scene.tools.forEach(t=>{let o=document.createElement('option');o.value=t.key;o.textContent=t.label;$('tool').append(o)});draw('xy',[0,1],d.scene);draw('xz',[0,2],d.scene);$('evidence').textContent=JSON.stringify(d.scene.tools.find(t=>t.key===$('tool').value),null,2)}
+$('rows').replaceChildren();for(const step of s.steps||[]){let tr=document.createElement('tr'),t=d.scene?.tools.find(t=>t.key===step.step_id);for(const text of [step.name,s.status==='ok'?`${step.score} / ${step.weight}`:'不可评分',t?t.distance_mm.toFixed(3)+' mm':'—',step.diagnosis?.reason||'无诊断']){let td=document.createElement('td');td.textContent=text;tr.append(td)}$('rows').append(tr)}
+$('contacts').textContent=(d.scene?.tools||[]).map(t=>{let o=s.observations?.[t.key];return o?`${t.label}：机器人接触 ${o.robot_contact?'有':'无'}，工具箱接触 ${o.toolbox_contact?'有':'无'}，近1仿真秒位置稳定 ${o.stable_last_sim_second?'是':'否'}（辅助观察）`:`${t.label}：等待观察`}).join('\n')+'\n夹爪关节：'+JSON.stringify(d.joints||{});$('meta').textContent=JSON.stringify({episode:d.episode,score:s,manifest:d.manifest},null,2)}
+$('tool').onchange=$('zoom').onchange=()=>latest&&render(latest);$('save').onclick=()=>{for(const id of ['xy','xz']){let a=document.createElement('a');a.download=`task3_${latest?.episode||'preview'}_${id}_${Date.now()}.png`;a.href=$(id).toDataURL();a.click()}};
+async function poll(){try{let r=await fetch('/api');render(await r.json())}catch(e){$('score').textContent='监控连接中断';$('status').textContent=String(e)}setTimeout(poll,500)}poll();
+</script></html>

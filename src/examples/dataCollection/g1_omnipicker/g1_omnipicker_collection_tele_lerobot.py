@@ -15,9 +15,16 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+os.environ.setdefault("NUMBA_CACHE_DIR", os.path.join(os.path.dirname(os.path.realpath(__file__)), "_lerobot_scratch", "numba_cache"))
+
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from yaml import Loader, load
+
+# ORCA eagerly creates its logger on import; initialize its supported log_dir
+# before importing controllers so installed packages need not be writable.
+from task3_monitor.bootstrap import prepare_logger
+prepare_logger(os.path.join(os.path.dirname(os.path.realpath(__file__)), "logs"))
 
 from conf import g1_omnipicker_conf
 from controllers import controllers
@@ -113,7 +120,11 @@ def main() -> None:
         "--camera_source", choices=("websocket", "mp4"), default="websocket",
         help="相机数据来源。websocket（默认）：内存流流式写盘；mp4：集末从服务端 MP4 提取帧。",
     )
+    parser.add_argument("--task3_monitor", action="store_true", help="启用 Task3 原始物理日志与主机评分监控")
+    parser.add_argument("--task3_monitor_port", type=int, default=8766)
     args = parser.parse_args()
+    if args.task3_monitor and args.camera_source != "websocket":
+        parser.error("Task3 scene/frame association currently requires --camera_source websocket")
 
     lerobot_out = os.path.abspath(os.path.expanduser(args.lerobot_out))
 
@@ -588,6 +599,7 @@ def main() -> None:
     orca_logger.info(f"开始采集，分类输出根目录: {lerobot_out}")
     hub = None
     writer = None
+    task3_capture = None
     try:
         hub = ClassifiedLeRobotHub(
             parent_root=lerobot_out,
@@ -613,6 +625,10 @@ def main() -> None:
             clock=args.clock,
             camera_source=args.camera_source,
         )
+        if args.task3_monitor:
+            from task3_monitor.capture import Capture
+            task3_capture = Capture(os.path.join(lerobot_out, "scene_sidecar"), args, env, manager, storage)
+            print(f"[Task3] 主机监控 http://127.0.0.1:{args.task3_monitor_port}/", flush=True)
         with hub:
             _ep_idx = 0
             while not manager._shutdown_requested:  # noqa: SLF001
@@ -641,10 +657,14 @@ def main() -> None:
                     flush=True,
                 )
 
+                if task3_capture:
+                    task3_capture.begin()
                 _ep_t0 = time.perf_counter()
                 # 执行一集遥操作采集
                 _task_is_success, _rec_start, _rec_end, _init_qpos = manager.run_episode()
                 _ep_dur = time.perf_counter() - _ep_t0
+                if task3_capture and task3_capture.journal:
+                    task3_capture.recording_end()
 
                 _ep_frames = storage.buffered_frame_count
 
@@ -658,6 +678,8 @@ def main() -> None:
 
                 # 右Grip单按：丢弃本集并继续下一集（不进入 REVIEW）
                 if _discard_episode_event.is_set():
+                    if task3_capture:
+                        task3_capture.finish("discarded")
                     _discard_episode_event.clear()
                     manager._shutdown_requested = False  # noqa: SLF001  继续下一集
                     storage.clear_data()
@@ -687,6 +709,8 @@ def main() -> None:
                     ep_start_wall=ep_start_wall,
                 )
                 if not parked:
+                    if task3_capture:
+                        task3_capture.finish("insufficient_frames")
                     orca_logger.warning(f"[EP {_ep_idx}] 帧数不足，未进入分类")
                     continue
 
@@ -704,6 +728,8 @@ def main() -> None:
                     break
 
                 if decision == DELETE:
+                    if task3_capture:
+                        task3_capture.finish("deleted")
                     storage.clear_data()
                     orca_logger.info(f"[EP {_ep_idx}] 分类=删除，不保存，不占 index")
                     print(">>> 已删除本集（不保存），继续下一集", flush=True)
@@ -714,6 +740,9 @@ def main() -> None:
                 ep_saved = storage.commit_parked_episode(dest)
                 cat_dir = CATEGORY_DIR[decision]
                 cat_root = hub.category_root(decision)
+                if task3_capture:
+                    task3_capture.finish("saved", lerobot_category=cat_dir,
+                                         lerobot_root=str(cat_root), lerobot_episode_index=ep_saved)
                 orca_logger.info(
                     f"✓ 本集已保存到 {cat_dir}/ episode {ep_saved}，"
                     f"该分类共 {dest.num_episodes} 集 / {dest.num_frames} 帧"
@@ -736,6 +765,8 @@ def main() -> None:
     except Exception as e:
         orca_logger.error(f"采集异常: {e}")
     finally:
+        if task3_capture:
+            task3_capture.close()
         _review_active.clear()
         _monitor_stop.set()
         if hub is not None:

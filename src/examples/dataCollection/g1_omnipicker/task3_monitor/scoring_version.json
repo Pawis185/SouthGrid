@@ -1,0 +1,22 @@
+{
+  "scorer_service/engine.py": "741be634b1d44b68e367b52d4385615fd24786d7681b52960f8c3bce51630b05",
+  "configs/tasks.yaml": "805df994cf816422f6701a0807a86cad5e5d4177979fd7a659fb8280941af90a",
+  "configs/robots.yaml": "c2bf1c16d6e876736c0bdaa0e3fe1ce51c1539102356cd94baee4dac65d6663a",
+  "scorer_service/frame_oracle.py": "f97ce2320cda18da91fd8b7ae6286fb5d253c8fb59056dee62d09a251e29c30d",
+  "orca_competition/__init__.py": "f5ec54bfec792af509b89f70d1781c34223df62a9b9900499ff8a53f3f3e0c7a",
+  "orca_competition/cli.py": "c95ca3c72dade67bfd03e2edfb5fce8132a6f5b88859793979bf447977874045",
+  "orca_competition/client.py": "36c89289719e4740519d0c93bd4f5b40baaa04faf6defe10a51426d2bffa4a75",
+  "orca_competition/condition_parser.py": "5d30b11afd311c0ff73d7d42864b94f8b0942b6a7a22e974be9836fddd8673eb",
+  "orca_competition/conditions.py": "ad63b739538254e3077fda2a1c39347e627d065ab81045f6a65f469dca15cb95",
+  "orca_competition/local_store.py": "5847e0e886ecc86980e50565f4ae7303dbcb7e820598bd92af5ae58a30062b46",
+  "orca_competition/models.py": "e83b87a74d8ea8f00a85e66ff5cca4a9242db2a1fb535bf81140e8b040e108f9",
+  "orca_competition/primitives.py": "48a6b2387ccb093409cbead49d0e1d7594e3fcec2a4cc2459b9937de27c997a7",
+  "orca_competition/probes.py": "4e4bef6b8ee480008dd2856b73d5be99eee9cc261999f8da13c0e0502ebfc634",
+  "orca_competition/registry.py": "b38ba582ccdf13fb358eb5b8fd05c49e28f60579f8cca7d740c8a5390a99f79d",
+  "orca_competition/robot_detector.py": "9d2b00537c2300d34e353f6a0c97cc87f119bbd85e7b0f2f2af4da6b36b1bd66",
+  "orca_competition/transport.py": "e27848b7d44a495ba56a244b82449a53bd1514986a8b995eba3370e8e29623a5",
+  "tasks/__init__.py": "4a42ea60b9f14c0d7bb08c3ba52c01fd3af1f3571d29f37fb614a803e7c47085",
+  "tasks/task_chain.py": "f4c188c762190a56ba781234aa46528b86ae38c530dc65a8fb6757db187381ed",
+  "tasks/task_chain_builder.py": "a149205659e4e211c25ae8c76ed1dd31c503f66f1111deae96e6bf769fac43be",
+  "tasks/voltage_test_chain.py": "ad50b110f59faea857464625cb78839a2f2785b2ca67cde30f456a217668ac49"
+}
