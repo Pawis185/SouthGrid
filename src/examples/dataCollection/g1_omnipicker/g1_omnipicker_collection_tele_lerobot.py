@@ -52,6 +52,12 @@ STREAM_TRIGGER_PATH = "/tmp/g1_lerobot_stream"
 base_dir = os.path.dirname(os.path.realpath(__file__))
 if base_dir not in sys.path:
     sys.path.insert(0, base_dir)
+from tool_slot_layout import (  # noqa: E402
+    N_LAYOUTS,
+    assignment_at,
+    layout_record,
+    place_tools,
+)
 from g1_classification_review import (  # noqa: E402
     CLASSIFICATION_BANNER,
     DELETE,
@@ -122,9 +128,19 @@ def main() -> None:
     )
     parser.add_argument("--task3_monitor", action="store_true", help="启用 Task3 原始物理日志与主机评分监控")
     parser.add_argument("--task3_monitor_port", type=int, default=8766)
+    parser.add_argument(
+        "--tool_layout_cycle",
+        type=int,
+        default=120,
+        help="成功保存后依次切换货架工具顺序的套数（默认 120=5! 全排列；0=不换序）",
+    )
     args = parser.parse_args()
     if args.task3_monitor and args.camera_source != "websocket":
         parser.error("Task3 scene/frame association currently requires --camera_source websocket")
+    if args.tool_layout_cycle < 0:
+        parser.error("--tool_layout_cycle 必须 >= 0")
+    if args.tool_layout_cycle > N_LAYOUTS:
+        parser.error(f"--tool_layout_cycle 最大为 {N_LAYOUTS}（5 件工具全排列）")
 
     lerobot_out = os.path.abspath(os.path.expanduser(args.lerobot_out))
 
@@ -560,6 +576,12 @@ def main() -> None:
     print("  放弃本集        →  录制中轻按【右手柄 Grip】（立即丢弃，不进入分类）", flush=True)
     print("  终止全部采集    →  【左右 Grip 同时按下】", flush=True)
     print("  强制退出        →  终端按 Ctrl+C", flush=True)
+    if args.tool_layout_cycle:
+        print("-" * 60, flush=True)
+        print(
+            f"  工具摆放        成功保存后换序，共 {args.tool_layout_cycle} 套；丢弃/删除重试当前套",
+            flush=True,
+        )
     print("=" * 60, flush=True)
     print("", flush=True)
 
@@ -632,6 +654,18 @@ def main() -> None:
         with hub:
             _ep_idx = 0
             while not manager._shutdown_requested:  # noqa: SLF001
+                layout_k = hub.total_episodes
+                if args.tool_layout_cycle and layout_k >= args.tool_layout_cycle:
+                    orca_logger.info(
+                        f"已保存 {layout_k} 集，达到 --tool_layout_cycle={args.tool_layout_cycle}，结束采集"
+                    )
+                    print(
+                        f"\n>>> 已完成 {args.tool_layout_cycle} 套工具摆放，采集结束",
+                        flush=True,
+                    )
+                    _safe_ui(f"已完成{args.tool_layout_cycle}套摆放", "0x00ff00", 3)
+                    break
+
                 _ep_idx += 1
                 env.reset()
                 time.sleep(0.1)
@@ -639,6 +673,15 @@ def main() -> None:
                     orca_logger.info("场景更新失败，停止采集")
                     break
                 env.set_default_joint_values(default_joint_values)
+
+                current_layout = None
+                if args.tool_layout_cycle:
+                    current_layout = layout_record(layout_k, args.tool_layout_cycle)
+                    place_tools(
+                        env,
+                        env.body(g1_omnipicker_conf.base_body),
+                        assignment_at(layout_k),
+                    )
 
                 # mp4 模式：每集开录
                 ep_dir: str | None = None
@@ -651,14 +694,32 @@ def main() -> None:
                     video_started = True
 
                 _collecting_ep_no = hub.total_episodes + 1
-                orca_logger.info(f"========== 正在采集第 {_collecting_ep_no} 集 ==========")
+                layout_hint = ""
+                if current_layout is not None:
+                    layout_hint = (
+                        f" 摆放 {current_layout['tool_layout_index'] + 1}/"
+                        f"{current_layout['tool_layout_count']} "
+                        f"左→右: {current_layout['layout_label']}"
+                    )
+                orca_logger.info(
+                    f"========== 正在采集第 {_collecting_ep_no} 集{layout_hint} =========="
+                )
                 print(
-                    f"\n>>> 正在采集第 {_collecting_ep_no} 集（按左Grip开始，再按左Grip结束并分类）",
+                    f"\n>>> 正在采集第 {_collecting_ep_no} 集（按左Grip开始，再按左Grip结束并分类）"
+                    f"{layout_hint}",
                     flush=True,
                 )
+                if current_layout is not None:
+                    _safe_ui(
+                        f"摆放{current_layout['tool_layout_index'] + 1}/"
+                        f"{current_layout['tool_layout_count']} "
+                        f"{current_layout['layout_label']}",
+                        "0x00ff88",
+                        0,
+                    )
 
                 if task3_capture:
-                    task3_capture.begin()
+                    task3_capture.begin(tool_layout=current_layout)
                 _ep_t0 = time.perf_counter()
                 # 执行一集遥操作采集
                 _task_is_success, _rec_start, _rec_end, _init_qpos = manager.run_episode()

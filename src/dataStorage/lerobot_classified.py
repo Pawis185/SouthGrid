@@ -5,6 +5,7 @@ parked episode is committed to exactly one category dataset, or discarded.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -106,9 +107,25 @@ class ClassifiedLeRobotHub:
             out[cat] = int(writer.num_episodes) if writer is not None else 0
         return out
 
+    def _disk_episode_count(self, category: str) -> int:
+        info = Path(self.category_root(category)) / "meta" / "info.json"
+        if not info.is_file():
+            return 0
+        try:
+            return int(json.loads(info.read_text()).get("total_episodes", 0))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return 0
+
     @property
     def total_episodes(self) -> int:
-        return sum(self.counts().values())
+        total = 0
+        for cat in (GOOD, QUALIFIED, DOUBTFUL):
+            writer = self._writers.get(cat)
+            if writer is not None:
+                total += int(writer.num_episodes)
+            else:
+                total += self._disk_episode_count(cat)
+        return total
 
     def close(self) -> None:
         if self._closed:

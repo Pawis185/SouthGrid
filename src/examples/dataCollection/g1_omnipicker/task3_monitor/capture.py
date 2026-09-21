@@ -59,7 +59,7 @@ class Capture:
         env.gym.mj_step = self.step
         storage.collection_data = self.collection
 
-    def begin(self):
+    def begin(self, tool_layout=None):
         if self.journal: self.finish('abandoned')
         self.sample_id = self.control_id = -1
         self.active = False
@@ -95,9 +95,14 @@ class Capture:
         # Persist the actual loaded model, including site/body configuration, without changing it.
         self.mj.mj_saveModel(m, str(self.journal.path/'scene.mjb'), None)
         meta['scene_mjb_sha256'] = hashlib.sha256((self.journal.path/'scene.mjb').read_bytes()).hexdigest()
+        if tool_layout:
+            meta['tool_layout'] = tool_layout
         self.journal.manifest['metadata'] = meta
         atomic(self.journal.path/'manifest.json', self.journal.manifest)
-        self.journal.emit('reset_completed', sim_time=float(self.env.gym._mjData.time))
+        reset_fields = dict(sim_time=float(self.env.gym._mjData.time))
+        if tool_layout:
+            reset_fields['tool_layout'] = tool_layout
+        self.journal.emit('reset_completed', **reset_fields)
         self.snapshot(recording=False)
         atomic(self.root/'current.json', {'episode_uuid': self.journal.id})
 
